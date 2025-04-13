@@ -280,11 +280,11 @@ def prediction():
         'B8A (864.8nm/864nm)': area_values.get('B8A', 0),
         'B11 (1613.7nm/1610.4nm)': area_values.get('B11', 0),
         'B12 (2202.4nm/2185.7nm)': area_values.get('B12', 0),
-        'RVSI': area_values.get('RVSI', 0),
         'NDVI': area_values.get('NDVI', 0),
-        'DWSI': area_values.get('DWSI', 0),
-        'NPCI': area_values.get('NPCI', 0),
         'GNDVI': area_values.get('GNDVI', 0),
+        'DWSI': area_values.get('DWSI', 0),
+        'RVSI': area_values.get('RVSI', 0),
+        'NPCI': area_values.get('NPCI', 0),
     }])
         print(features)
         prediction = model.predict(features)
