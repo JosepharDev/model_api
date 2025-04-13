@@ -1,24 +1,34 @@
 from flask import Flask, request, jsonify
 import joblib
 import numpy as np
+import pandas as pd
 import logging
 from datetime import datetime, timedelta
 
-import ee
+import ee, os
 from google.oauth2 import service_account
-
+import google.auth.transport.requests
 # Authenticate using service account
-SERVICE_ACCOUNT_FILE = "certain-catcher-430110-v2-7beec7335614.json"
-SCOPES = ["https://www.googleapis.com/auth/earthengine.readonly"]
+#SERVICE_ACCOUNT_FILE = "certain-catcher-430110-v2-7beec7335614.json"
+#SCOPES = ["https://www.googleapis.com/auth/earthengine.readonly"]
 
-credentials = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE,
-    scopes=SCOPES
-)
+#credentials = service_account.Credentials.from_service_account_file(
+#    SERVICE_ACCOUNT_FILE,
+#    scopes=SCOPES
+#)
 
-ee.Initialize(credentials)
+#ee.Initialize(credentials)
 app = Flask(__name__)
 model = joblib.load('model.pkl')
+
+GEE_CREDENTIALS = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+credentials = service_account.Credentials.from_service_account_file(GEE_CREDENTIALS,scopes=['https://www.googleapis.com/auth/earthengine'])
+credentials.refresh(google.auth.transport.requests.Request())
+ee.Initialize(credentials)
+
+
+
+
 
 #ee.Initialize(project="certain-catcher-430110-v2")
 def get_indices(point, start_date, end_date):
@@ -259,24 +269,24 @@ def prediction():
             end_date = start_date
         indices = extract_bands_indices(coordinates, start_date, end_date)
         area_values = indices['area_values']
-        features = np.array([
-            area_values.get('B2', 0),   # Blue
-            area_values.get('B3', 0),   # Green
-            area_values.get('B4', 0),   # Red
-            area_values.get('B5', 0),   # Red Edge 1
-            area_values.get('B6', 0),   # Red Edge 2
-            area_values.get('B7', 0),   # Red Edge 3
-            area_values.get('B8', 0),   # NIR
-            area_values.get('B8A', 0),  # Red Edge 4
-            area_values.get('B11', 0),  # SWIR 1
-            area_values.get('B12', 0), # SWIR 2
-            area_values.get('NDVI', 0),  # NDVI
-            area_values.get('GNDVI', 0),   # GNDVI
-            area_values.get('NPCI', 0),   #  NPCI
-            area_values.get('DWSI', 0),   # DWSI
-            area_values.get('RVSI', 0),   # RVSI
-            
-        ]).reshape(1, -1)
+        features = pd.DataFrame([{
+        'B2 (496.6nm/492.1nm)': area_values.get('B2', 0),
+        'B3 (560nm/559nm)': area_values.get('B3', 0),
+        'B4 (664.5nm/665nm)': area_values.get('B4', 0),
+        'B5 (703.9nm/703.8nm)': area_values.get('B5', 0),
+        'B6 (740.2nm/739.1nm)': area_values.get('B6', 0),
+        'B7 (782.5nm/779.7nm)': area_values.get('B7', 0),
+        'B8 (835.1nm/833nm)': area_values.get('B8', 0),
+        'B8A (864.8nm/864nm)': area_values.get('B8A', 0),
+        'B11 (1613.7nm/1610.4nm)': area_values.get('B11', 0),
+        'B12 (2202.4nm/2185.7nm)': area_values.get('B12', 0),
+        'RVSI': area_values.get('RVSI', 0),
+        'NDVI': area_values.get('NDVI', 0),
+        'DWSI': area_values.get('DWSI', 0),
+        'NPCI': area_values.get('NPCI', 0),
+        'GNDVI': area_values.get('GNDVI', 0),
+    }])
+        print(features)
         prediction = model.predict(features)
         probabilities = model.predict_proba(features)
         result = int(prediction[0])
