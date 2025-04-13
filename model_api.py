@@ -5,11 +5,22 @@ import logging
 from datetime import datetime, timedelta
 
 import ee
+from google.oauth2 import service_account
 
+# Authenticate using service account
+SERVICE_ACCOUNT_FILE = "certain-catcher-430110-v2-7beec7335614.json"
+SCOPES = ["https://www.googleapis.com/auth/earthengine.readonly"]
+
+credentials = service_account.Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE,
+    scopes=SCOPES
+)
+
+ee.Initialize(credentials)
 app = Flask(__name__)
 model = joblib.load('model.pkl')
 
-ee.Initialize(project="certain-catcher-430110-v2")
+#ee.Initialize(project="certain-catcher-430110-v2")
 def get_indices(point, start_date, end_date):
     try:
         # First try with cloud filter

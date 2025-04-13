@@ -2,3 +2,4 @@ Flask
 joblib
 numpy
 scikit-learn
+earthengine-api
