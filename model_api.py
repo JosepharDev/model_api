@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 import logging
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+
 
 import ee, os
 from google.oauth2 import service_account
@@ -33,73 +35,84 @@ ee.Initialize(credentials)
 #ee.Initialize(project="certain-catcher-430110-v2")
 def get_indices(point, start_date, end_date):
     try:
-        # First try with cloud filter
+        def mask_s2_sr(image):
+            # Select QA60 band and SCL (Scene Classification Layer)
+            qa60 = image.select('QA60')
+            scl = image.select('SCL')
+
+            # Bit 10 and 11 in QA60 are clouds and cirrus
+            cloud_bit_mask = 1 << 10  # clouds
+            cirrus_bit_mask = 1 << 11  # cirrus
+
+            # QA60 mask
+            mask_qa60 = qa60.bitwiseAnd(cloud_bit_mask).eq(0).And(
+                        qa60.bitwiseAnd(cirrus_bit_mask).eq(0))
+
+            # Mask out clouds, shadows, snow using SCL values
+            # Keep only classes like vegetation (4, 5), bare soils (6), water (8)
+            mask_scl = scl.neq(3).And(  # cloud shadow
+                        scl.neq(9)).And(  # clouds
+                        scl.neq(10)).And(  # cirrus
+                        scl.neq(1))  # saturated or defective
+
+            # Combine both masks
+            return image.updateMask(mask_qa60).updateMask(mask_scl)
+
+        # Apply cloud filtering and masking
         collection = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
             .filterBounds(point)
             .filterDate(start_date, end_date)
-            .sort("CLOUDY_PIXEL_PERCENTAGE")
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+            .map(mask_s2_sr)  # ⬅️ apply the improved cloud mask
         )
         # Check if collection is empty
         if collection.size().getInfo() == 0:
-            # Fallback to collection with higher cloud cover
-            collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED').filterBounds(point).filterDate(start_date, end_date).filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))  # Increased cloud threshold
+            return {
+                'NDVI': None,
+                'GNDVI': None,
+                'DWSI': None,
+                'RVS1': None,
+                'data_available': False
+            }
 
-            if collection.size().getInfo() == 0:
-                # Final fallback - no cloud filter
-                collection = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-                    .filterBounds(point)
-                    .filterDate(start_date, end_date)
-                )
+        # Use median of cloud-free images
+        cloud_free_img = collection.median()
+        cloud_free_img = cloud_free_img.divide(10000)
+        ndvi = cloud_free_img.normalizedDifference(['B8', 'B4']).rename('NDVI')
+        # NIR−[540:570] / NIR+[540:570]
+        gndvi = cloud_free_img.normalizedDifference(['B8', 'B3']).rename('GNDVI')
+        npci = cloud_free_img.expression('((B4 - B1) / (B4 + B1))', {
+            'B1': cloud_free_img.select('B1'),
+            'B4': cloud_free_img.select('B4')
+        }).rename('NPCI')
+        # 802nm+547nm / 1657nm+682nm (B8 + B3) / (B11 + B4)
+        dwsi = cloud_free_img.expression('((B8 + B3) / (B11 + B4))', {
+            'B3': cloud_free_img.select('B3'),
+            'B4': cloud_free_img.select('B4'),
+            'B8': cloud_free_img.select('B8'),
+            'B11': cloud_free_img.select('B11')
+        }).rename('DWSI')
+        #718nm+748nm/2−733nm
+        rvs1 = cloud_free_img.expression('((B5 + B7) / 2) - B6', {
+            'B5': cloud_free_img.select('B5'),
+            'B6': cloud_free_img.select('B6'),
+            'B7': cloud_free_img.select('B7')
+        }).rename('RVS1')
 
-                if collection.size().getInfo() == 0:
-                    return {
-                        'NDVI': None,
-                        'GNDVI': None,
-                        'DWSI': None,
-                        'RSV1': None,
-                        'data_available': False
-                    }
+        all_indices = ndvi.addBands(gndvi).addBands(dwsi).addBands(rvs1)
 
-        # Calculate median image
-        median_img = collection.median()
-
-        # Cloud masking using the QA60 band (bit 10)
-        qa60 = median_img.select(['QA60']).toInt()
-        cloud_mask = qa60.bitwiseAnd(1 << 10).eq(0)  # Mask out clouds (if QA60 bit is 0)
-
-        # Apply cloud mask to the median image
-        cloud_free_img = median_img.updateMask(cloud_mask)
-
-        # --- helper function ---
-        def calculate_index(img, method, *args):
-            try:
-                if method == 'nd':
-                    result = img.normalizedDifference(args).rename('nd').reduceRegion(
-                        reducer=ee.Reducer.mean(),
-                        geometry=point,
-                        scale=10,
-                        bestEffort=True
-                    ).getInfo()
-                    return result.get('nd', None)
-                elif method == 'ratio':
-                    result = img.select(args[0]).divide(img.select(args[1])).rename('ratio').reduceRegion(
-                        reducer=ee.Reducer.mean(),
-                        geometry=point,
-                        scale=10,
-                        bestEffort=True
-                    ).getInfo()
-                    return result.get('ratio', None)
-            except Exception as e:
-                print(f"Error calculating index: {e}")
-                return None
-
-        # --- Final return with calculated indices ---
+        values = all_indices.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=point,
+            scale=10,
+            bestEffort=True
+        ).getInfo()
         return {
-            'NDVI': calculate_index(cloud_free_img, 'nd', 'B8', 'B4'),
-            'GNDVI': calculate_index(cloud_free_img, 'nd', 'B8', 'B3'),
-            'DWSI': calculate_index(cloud_free_img, 'nd', 'B8', 'B11'),
-            'RSV1': calculate_index(cloud_free_img, 'ratio', 'B4', 'B2'),
-            'data_available': True
+            'NDVI': values.get('NDVI'),
+            'GNDVI': values.get('GNDVI'),
+            'DWSI': values.get('DWSI'),
+            'RVS1': values.get('RVS1'),
+            'data_available': any(values.values())
         }
 
     except Exception as e:
@@ -108,7 +121,7 @@ def get_indices(point, start_date, end_date):
             'NDVI': None,
             'GNDVI': None,
             'DWSI': None,
-            'RSV1': None,
+            'RVS1': None,
             'data_available': False
         }
 
@@ -117,72 +130,70 @@ def monitoring_graph():
     try:
         data = request.get_json()
 
-        # Get polygon coordinates
+        # Validate input
         coordinates = data.get('coordinates')
         if not coordinates:
             return jsonify({'error': 'Missing polygon coordinates'}), 400
 
-        # Parse start_date
         start_date_str = data.get('start_date')
         if not start_date_str:
             return jsonify({'error': 'Missing start_date'}), 400
+
         try:
             start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
         except ValueError:
             return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD.'}), 400
 
-        # Optional: You may want to extract centroid for lat/lon-based fallback
         polygon = ee.Geometry.Polygon(coordinates)
-        centroid = polygon.centroid().coordinates().getInfo()
-        lon, lat = centroid[0], centroid[1]
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 400
+        return jsonify({'error+++': str(e)}), 400
 
-    # Prepare GEE data processing
+    time_windows = (
+        [(start_date + timedelta(days=i), 5, 'Sowing') for i in range(0, 115, 5)] +  # Sowing stage
+        [(start_date + timedelta(days=i), 5, 'Flowering') for i in range(115, 145, 5)] +  # Flowering stage
+        [(start_date + timedelta(days=i), 5, 'Harvesting') for i in range(145, 181, 5)]  # Harvesting stage
+    )
+
+    # Helper function for parallel execution
+    def process_week(week_data):
+        begin, days, growth_stage = week_data
+        end = begin + timedelta(days=days)
+        try:
+            indices = get_indices(polygon, begin, end)
+            # if not indices.get('data_available', False):
+                # return {
+                #     'date': begin,
+                #     'data_available': False,
+                #     'growth_stage': growth_stage
+                # }
+
+            return {
+                'date': begin,
+                'NDVI': indices.get('NDVI'),
+                'GNDVI': indices.get('GNDVI'),
+                'DWSI': indices.get('DWSI'),
+                'RVS1': indices.get('RVS1'),
+                'data_available': True,
+                'growth_stage': growth_stage
+            }
+        except Exception as e:
+            return {
+                'date': begin.strftime('%Y-%m-%d'),
+                'error': str(e),
+                'data_available': False,
+                'growth':growth_stage
+            }
+
     try:
-        response_data = []
-        missing_data_count = 0
+        # Multithreading with limit
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            results = list(executor.map(process_week, time_windows))
 
-        # 7-day intervals from day 0–125, 14-day intervals from day 127–177
-        time_windows = (
-            [(start_date + timedelta(days=i), 7) for i in range(0, 126, 7)] +
-            [(start_date + timedelta(days=i), 14) for i in range(127, 178, 7)]
-        )
-        for begin, days in time_windows:
-            end = begin + timedelta(days=days)
-            try:
-                indices = get_indices(polygon, begin.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))
-
-                if indices and indices.get('data_available') and any([
-                    indices.get('NDVI') is not None,
-                    indices.get('GNDVI') is not None,
-                    indices.get('DWSI') is not None,
-                    indices.get('RSV1') is not None
-                ]):
-                    response_data.append({
-                        'date': begin.strftime('%Y-%m-%d'),
-                        'NDVI': indices.get('NDVI'),
-                        'GNDVI': indices.get('GNDVI'),
-                        'DWSI': indices.get('DWSI'),
-                        'RSV1': indices.get('RSV1'),
-                        'data_available': True
-                    })
-                else:
-                    missing_data_count += 1
-            except Exception as e:
-                print(e)
-                missing_data_count += 1
-                response_data.append({
-                    'date': begin.strftime('%Y-%m-%d'),
-                    'error': str(e),
-                    'data_available': False
-                })
-
-        return jsonify(response_data)
+        return jsonify(results)
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error?????': str(e)}), 500
 
 # #-------------------------------------------------------
 
@@ -196,24 +207,35 @@ def extract_bands_indices(geometry, start_str, end_str):
         .filterBounds(point)
         .filterDate(ee.Date(start_date).advance(-3, 'day'), ee.Date(end_date).advance(3, 'day'))
         .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
-        .select(['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'B12']))
+        .select(['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11']))
+
         image = collection.median()
+
         image = image.divide(10000)
         ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
+        # NIR−[540:570] / NIR+[540:570]
         gndvi = image.normalizedDifference(['B8', 'B3']).rename('GNDVI')
-        npc_i = image.normalizedDifference(['B4', 'B2']).rename('NPCI')
-        dwsi = image.expression('(B8A - B11) / (B8A + B11)', {
-            'B8A': image.select('B8A'),
+        npci = image.expression('((B4 - B1) / (B4 + B1))', {
+            'B1': image.select('B1'),
+            'B4': image.select('B4')
+        }).rename('NPCI')
+        # 802nm+547nm / 1657nm+682nm (B8 + B3) / (B11 + B4)
+        dswi = image.expression('((B8 + B3) / (B11 + B4))', {
+            'B3': image.select('B3'),
+            'B4': image.select('B4'),
+            'B8': image.select('B8'),
             'B11': image.select('B11')
-        }).rename('DWSI')
-        rvsi = image.expression('(B3 - B2) / (B3 + B2)', {
-            'B2': image.select('B2'),
-            'B3': image.select('B3')
-        }).rename('RVSI')
+        }).rename('DSWI')
+        #718nm+748nm/2−733nm
+        rvs1 = image.expression('((B5 + B7) / 2) - B6', {
+            'B5': image.select('B5'),
+            'B6': image.select('B6'),
+            'B7': image.select('B7')
+        }).rename('RVS1')
 
 
         # Combine all bands and indices into one image
-        combined = image.addBands([ndvi, gndvi, npc_i, dwsi, rvsi])
+        combined = image.addBands([ndvi, gndvi, npc_i, dwsi, rvs1])
 
         # Extract values at point
         values = combined.reduceRegion(
