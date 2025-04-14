@@ -207,7 +207,7 @@ def extract_bands_indices(geometry, start_str, end_str):
         .filterBounds(point)
         .filterDate(ee.Date(start_date).advance(-3, 'day'), ee.Date(end_date).advance(3, 'day'))
         .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
-        .select(['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11']))
+        .select(['B1','B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11']))
 
         image = collection.median()
 
@@ -220,12 +220,12 @@ def extract_bands_indices(geometry, start_str, end_str):
             'B4': image.select('B4')
         }).rename('NPCI')
         # 802nm+547nm / 1657nm+682nm (B8 + B3) / (B11 + B4)
-        dswi = image.expression('((B8 + B3) / (B11 + B4))', {
+        dwsi = image.expression('((B8 + B3) / (B11 + B4))', {
             'B3': image.select('B3'),
             'B4': image.select('B4'),
             'B8': image.select('B8'),
             'B11': image.select('B11')
-        }).rename('DSWI')
+        }).rename('DWSI')
         #718nm+748nm/2−733nm
         rvs1 = image.expression('((B5 + B7) / 2) - B6', {
             'B5': image.select('B5'),
@@ -235,7 +235,7 @@ def extract_bands_indices(geometry, start_str, end_str):
 
 
         # Combine all bands and indices into one image
-        combined = image.addBands([ndvi, gndvi, npc_i, dwsi, rvs1])
+        combined = image.addBands([ndvi, gndvi, npci, dwsi, rvs1])
 
         # Extract values at point
         values = combined.reduceRegion(
