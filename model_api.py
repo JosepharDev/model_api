@@ -5,21 +5,10 @@ import pandas as pd
 import logging
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
-
-
 import ee, os
 from google.oauth2 import service_account
 import google.auth.transport.requests
-# Authenticate using service account
-#SERVICE_ACCOUNT_FILE = "certain-catcher-430110-v2-7beec7335614.json"
-#SCOPES = ["https://www.googleapis.com/auth/earthengine.readonly"]
 
-#credentials = service_account.Credentials.from_service_account_file(
-#    SERVICE_ACCOUNT_FILE,
-#    scopes=SCOPES
-#)
-
-#ee.Initialize(credentials)
 app = Flask(__name__)
 model = joblib.load('model.pkl')
 
@@ -29,41 +18,57 @@ credentials.refresh(google.auth.transport.requests.Request())
 ee.Initialize(credentials)
 
 
-
-
-
-#ee.Initialize(project="certain-catcher-430110-v2")
 def get_indices(point, start_date, end_date):
     try:
         def mask_s2_sr(image):
-            # Select QA60 band and SCL (Scene Classification Layer)
             qa60 = image.select('QA60')
             scl = image.select('SCL')
 
-            # Bit 10 and 11 in QA60 are clouds and cirrus
-            cloud_bit_mask = 1 << 10  # clouds
-            cirrus_bit_mask = 1 << 11  # cirrus
+            cloud_bit_mask = 1 << 10
+            # cirrus_bit_mask = 1 << 11
 
-            # QA60 mask
-            mask_qa60 = qa60.bitwiseAnd(cloud_bit_mask).eq(0).And(
-                        qa60.bitwiseAnd(cirrus_bit_mask).eq(0))
+            mask_qa60 = qa60.bitwiseAnd(cloud_bit_mask).eq(0)
+                        #.And(qa60.bitwiseAnd(cirrus_bit_mask).eq(0))
 
-            # Mask out clouds, shadows, snow using SCL values
-            # Keep only classes like vegetation (4, 5), bare soils (6), water (8)
-            mask_scl = scl.neq(3).And(  # cloud shadow
-                        scl.neq(9)).And(  # clouds
-                        scl.neq(10)).And(  # cirrus
-                        scl.neq(1))  # saturated or defective
+            mask_scl = scl.neq(9).And(  # high probability cloud
+                        # scl.neq(3)).And(  # cloud shadow
+                        scl.neq(9)).And(  # high probability cloud
+                        scl.neq(8)).And( # medium probability cloud
+                        scl.neq(7)).And(  # Clouds Low Probability / Unclassified
+                        # scl.neq(10)).And(  # cirrus
+                        scl.neq(1)).And( # saturated/defective
+                        scl.neq(11)).And( # Snow / Ice
+                        scl.neq(2)) # Dark Area Pixels
 
-            # Combine both masks
-            return image.updateMask(mask_qa60).updateMask(mask_scl)
+            masked_image = image.updateMask(mask_qa60).updateMask(mask_scl)
+
+            # Optional: tag each image with the percentage of valid pixels over point
+            valid_pixel_count = masked_image.select('B4').reduceRegion(
+                reducer=ee.Reducer.count(),
+                geometry=point,
+                scale=10,
+                maxPixels=1e8
+            ).get('B4')
+
+            total_pixel_count = image.select('B4').reduceRegion(
+                reducer=ee.Reducer.count(),
+                geometry=point,
+                scale=10,
+                maxPixels=1e8
+            ).get('B4')
+
+            # Calculate percentage of valid pixels
+            cloud_free_ratio = ee.Number(valid_pixel_count).divide(ee.Number(total_pixel_count)).multiply(100)
+            return masked_image.set('cloud_free_percent', cloud_free_ratio)
 
         # Apply cloud filtering and masking
         collection = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
             .filterBounds(point)
             .filterDate(start_date, end_date)
-            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
-            .map(mask_s2_sr)  # ⬅️ apply the improved cloud mask
+            # .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
+            .map(mask_s2_sr)
+            # .filter(ee.Filter.gt('cloud_free_percent', 10))
+            .sort('CLOUDY_PIXEL_PERCENTAGE')
         )
         # Check if collection is empty
         if collection.size().getInfo() == 0:
@@ -71,20 +76,22 @@ def get_indices(point, start_date, end_date):
                 'NDVI': None,
                 'GNDVI': None,
                 'DWSI': None,
-                'RVS1': None,
+                'RVSI': None,
+                'NPCI': None,
                 'data_available': False
             }
-
-        # Use median of cloud-free images
-        cloud_free_img = collection.median()
+        cloud_free_img = collection.first()
         cloud_free_img = cloud_free_img.divide(10000)
+
         ndvi = cloud_free_img.normalizedDifference(['B8', 'B4']).rename('NDVI')
+
         # NIR−[540:570] / NIR+[540:570]
         gndvi = cloud_free_img.normalizedDifference(['B8', 'B3']).rename('GNDVI')
         npci = cloud_free_img.expression('((B4 - B1) / (B4 + B1))', {
             'B1': cloud_free_img.select('B1'),
             'B4': cloud_free_img.select('B4')
         }).rename('NPCI')
+
         # 802nm+547nm / 1657nm+682nm (B8 + B3) / (B11 + B4)
         dwsi = cloud_free_img.expression('((B8 + B3) / (B11 + B4))', {
             'B3': cloud_free_img.select('B3'),
@@ -92,14 +99,15 @@ def get_indices(point, start_date, end_date):
             'B8': cloud_free_img.select('B8'),
             'B11': cloud_free_img.select('B11')
         }).rename('DWSI')
+
         #718nm+748nm/2−733nm
         rvs1 = cloud_free_img.expression('((B5 + B7) / 2) - B6', {
             'B5': cloud_free_img.select('B5'),
             'B6': cloud_free_img.select('B6'),
             'B7': cloud_free_img.select('B7')
-        }).rename('RVS1')
+        }).rename('RVSI')
 
-        all_indices = ndvi.addBands(gndvi).addBands(dwsi).addBands(rvs1)
+        all_indices = ndvi.addBands(gndvi).addBands(dwsi).addBands(rvs1).addBands(npci)
 
         values = all_indices.reduceRegion(
             reducer=ee.Reducer.mean(),
@@ -107,11 +115,14 @@ def get_indices(point, start_date, end_date):
             scale=10,
             bestEffort=True
         ).getInfo()
+        
         return {
+            "image":collection.first(),
             'NDVI': values.get('NDVI'),
             'GNDVI': values.get('GNDVI'),
             'DWSI': values.get('DWSI'),
-            'RVS1': values.get('RVS1'),
+            'RVSI': values.get('RVSI'),
+            'NPCI': values.get('NPCI'),
             'data_available': any(values.values())
         }
 
@@ -121,7 +132,8 @@ def get_indices(point, start_date, end_date):
             'NDVI': None,
             'GNDVI': None,
             'DWSI': None,
-            'RVS1': None,
+            'RVSI': None,
+            'NPCI': None,
             'data_available': False
         }
 
@@ -150,36 +162,38 @@ def monitoring_graph():
         return jsonify({'error+++': str(e)}), 400
 
     time_windows = (
-        [(start_date + timedelta(days=i), 5, 'Sowing') for i in range(0, 115, 5)] +  # Sowing stage
-        [(start_date + timedelta(days=i), 5, 'Flowering') for i in range(115, 145, 5)] +  # Flowering stage
-        [(start_date + timedelta(days=i), 5, 'Harvesting') for i in range(145, 181, 5)]  # Harvesting stage
+        [(start_date + timedelta(days=i), 3, 'Sowing') for i in range(0, 115, 3)] +  # Sowing stage
+        [(start_date + timedelta(days=i), 3, 'Flowering') for i in range(115, 145, 3)] +  # Flowering stage
+        [(start_date + timedelta(days=i), 3, 'Harvesting') for i in range(145, 198, 3)]  # Harvesting stage
     )
 
     # Helper function for parallel execution
     def process_week(week_data):
         begin, days, growth_stage = week_data
         end = begin + timedelta(days=days)
+        # print(begin, "=====", end)
         try:
             indices = get_indices(polygon, begin, end)
-            # if not indices.get('data_available', False):
-                # return {
-                #     'date': begin,
-                #     'data_available': False,
-                #     'growth_stage': growth_stage
-                # }
+            if not indices.get('data_available', False):
+                return None
+
+            image = indices.get('image')
+            date_info = image.get('system:time_start')
+            date_str = ee.Date(date_info).format('YYYY-MM-dd').getInfo()
 
             return {
-                'date': begin,
+                'Date': date_str,
                 'NDVI': indices.get('NDVI'),
                 'GNDVI': indices.get('GNDVI'),
                 'DWSI': indices.get('DWSI'),
-                'RVS1': indices.get('RVS1'),
+                'RVSI': indices.get('RVSI'),
+                'NPCI': indices.get('NPCI'),
                 'data_available': True,
                 'growth_stage': growth_stage
             }
         except Exception as e:
             return {
-                'date': begin.strftime('%Y-%m-%d'),
+                'Date': begin.strftime('%Y-%m-%d'),
                 'error': str(e),
                 'data_available': False,
                 'growth':growth_stage
@@ -187,9 +201,9 @@ def monitoring_graph():
 
     try:
         # Multithreading with limit
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=20) as executor:
             results = list(executor.map(process_week, time_windows))
-
+        results = [result for result in results if result is not None]
         return jsonify(results)
 
     except Exception as e:
@@ -197,17 +211,63 @@ def monitoring_graph():
 
 # #-------------------------------------------------------
 
+
 def extract_bands_indices(geometry, start_str, end_str):
     if start_str == end_str:
         start_date = datetime.strptime(start_str, '%Y-%m-%d')
         end_date = datetime.strptime(end_str, '%Y-%m-%d')
     try:
+        def mask_s2_sr(image):
+            qa60 = image.select('QA60')
+            scl = image.select('SCL')
+
+            cloud_bit_mask = 1 << 10
+            # cirrus_bit_mask = 1 << 11
+
+            mask_qa60 = qa60.bitwiseAnd(cloud_bit_mask).eq(0)
+                        # .And(qa60.bitwiseAnd(cirrus_bit_mask).eq(0))
+
+            mask_scl = scl.neq(9).And(  # high probability cloud
+                        # scl.neq(3)).And(  # cloud shadow
+                        scl.neq(9)).And(  # high probability cloud
+                        scl.neq(8)).And( # medium probability cloud
+                        scl.neq(7)).And(  # Clouds Low Probability / Unclassified
+                        # scl.neq(10)).And(  # cirrus
+                        scl.neq(1)).And( # saturated/defective
+                        scl.neq(11)).And( # Snow / Ice
+                        scl.neq(2)) # Dark Area Pixels
+
+            masked_image = image.updateMask(mask_qa60).updateMask(mask_scl)
+
+            # Optional: tag each image with the percentage of valid pixels over point
+            valid_pixel_count = masked_image.select('B4').reduceRegion(
+                reducer=ee.Reducer.count(),
+                geometry=point,
+                scale=10,
+                maxPixels=1e8
+            ).get('B4')
+
+            total_pixel_count = image.select('B4').reduceRegion(
+                reducer=ee.Reducer.count(),
+                geometry=point,
+                scale=10,
+                maxPixels=1e8
+            ).get('B4')
+
+            # Calculate percentage of valid pixels
+            cloud_free_ratio = ee.Number(valid_pixel_count).divide(ee.Number(total_pixel_count)).multiply(100)
+
+            return masked_image.set('cloud_free_percent', cloud_free_ratio)
+
         point = ee.Geometry.Polygon(geometry)
-        collection = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-        .filterBounds(point)
-        .filterDate(ee.Date(start_date).advance(-3, 'day'), ee.Date(end_date).advance(3, 'day'))
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
-        .select(['B1','B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11']))
+        collection = (
+            ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+            .filterBounds(point)
+            .filterDate(ee.Date(start_date).advance(-3, 'day'), ee.Date(end_date).advance(20, 'day'))
+            # .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+            .map(mask_s2_sr)
+            .filter(ee.Filter.gt('cloud_free_percent', 50)) 
+        )
 
         image = collection.median()
 
@@ -227,19 +287,19 @@ def extract_bands_indices(geometry, start_str, end_str):
             'B11': image.select('B11')
         }).rename('DWSI')
         #718nm+748nm/2−733nm
-        rvs1 = image.expression('((B5 + B7) / 2) - B6', {
+        RVSI = image.expression('((B5 + B7) / 2) - B6', {
             'B5': image.select('B5'),
             'B6': image.select('B6'),
             'B7': image.select('B7')
-        }).rename('RVS1')
+        }).rename('RVSI')
 
 
         # Combine all bands and indices into one image
-        combined = image.addBands([ndvi, gndvi, npci, dwsi, rvs1])
+        combined = image.addBands([ndvi, gndvi, npci, dwsi, RVSI])
 
         # Extract values at point
         values = combined.reduceRegion(
-            reducer=ee.Reducer.first(),
+            reducer=ee.Reducer.mean(),
             geometry=point,
             scale=10,
             maxPixels=1e9
@@ -308,7 +368,7 @@ def prediction():
         'RVSI': area_values.get('RVSI', 0),
         'NPCI': area_values.get('NPCI', 0),
     }])
-        print(features)
+        # print(features)
         prediction = model.predict(features)
         probabilities = model.predict_proba(features)
         result = int(prediction[0])
