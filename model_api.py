@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 import ee, os
 from google.oauth2 import service_account
 import google.auth.transport.requests
+from datetime import datetime
+import pytz
 
 app = Flask(__name__)
 model = joblib.load('model.pkl')
@@ -65,9 +67,9 @@ def get_indices(point, start_date, end_date):
         collection = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
             .filterBounds(point)
             .filterDate(start_date, end_date)
-            # .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
+            # .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
             .map(mask_s2_sr)
-            # .filter(ee.Filter.gt('cloud_free_percent', 10))
+            .filter(ee.Filter.gt('cloud_free_percent', 90))
             .sort('CLOUDY_PIXEL_PERCENTAGE')
         )
         # Check if collection is empty
@@ -162,9 +164,9 @@ def monitoring_graph():
         return jsonify({'error+++': str(e)}), 400
 
     time_windows = (
-        [(start_date + timedelta(days=i), 3, 'Sowing') for i in range(0, 115, 3)] +  # Sowing stage
-        [(start_date + timedelta(days=i), 3, 'Flowering') for i in range(115, 145, 3)] +  # Flowering stage
-        [(start_date + timedelta(days=i), 3, 'Harvesting') for i in range(145, 198, 3)]  # Harvesting stage
+        [(start_date + timedelta(days=i), 3, 'Sowing') for i in range(0, 38, 3)] +  # Sowing stage
+        [(start_date + timedelta(days=i), 3, 'Flowering') for i in range(38, 120, 3)] +  # Flowering stage
+        [(start_date + timedelta(days=i), 3, 'Harvesting') for i in range(120, 198, 3)]  # Harvesting stage
     )
 
     # Helper function for parallel execution
@@ -212,10 +214,10 @@ def monitoring_graph():
 # #-------------------------------------------------------
 
 
-def extract_bands_indices(geometry, start_str, end_str):
-    if start_str == end_str:
-        start_date = datetime.strptime(start_str, '%Y-%m-%d')
-        end_date = datetime.strptime(end_str, '%Y-%m-%d')
+def extract_bands_indices(geometry):
+
+    time_now = datetime.now()
+    start_date = time_now.strftime('%Y-%m-%d')
     try:
         def mask_s2_sr(image):
             qa60 = image.select('QA60')
@@ -263,8 +265,8 @@ def extract_bands_indices(geometry, start_str, end_str):
         collection = (
             ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
             .filterBounds(point)
-            .filterDate(ee.Date(start_date).advance(-3, 'day'), ee.Date(end_date).advance(20, 'day'))
-            # .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+            .filterDate(ee.Date(start_date).advance(-7, 'day'), ee.Date(start_date).advance(20, 'day'))
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
             .map(mask_s2_sr)
             .filter(ee.Filter.gt('cloud_free_percent', 50)) 
         )
@@ -305,11 +307,10 @@ def extract_bands_indices(geometry, start_str, end_str):
             maxPixels=1e9
         ).getInfo()
 
-        # Return values with a fallback
         return {
         'area_values': values or {},  # Fallback if empty
         'band_info': {
-            # Spectral bands with exact wavelengths from your requirements
+            # Spectral bands with exact wavelengths
             'B2': {'name': 'Blue', 'wavelength': 496.6, 'type': 'spectral'},
             'B3': {'name': 'Green', 'wavelength': 560, 'type': 'spectral'},
             'B4': {'name': 'Red', 'wavelength': 664.5, 'type': 'spectral'},
@@ -321,7 +322,7 @@ def extract_bands_indices(geometry, start_str, end_str):
             'B11': {'name': 'SWIR 1', 'wavelength': 1613.7, 'type': 'spectral'},
             'B12': {'name': 'SWIR 2', 'wavelength': 2202.4, 'type': 'spectral'},
             
-            # Vegetation indices (no wavelength)
+            # Vegetation indices
             'NDVI': {'name': 'NDVI', 'type': 'index'},
             'GNDVI': {'name': 'Green NDVI', 'type': 'index'},
             'NPCI': {'name': 'NPCI', 'type': 'index'},
@@ -330,7 +331,6 @@ def extract_bands_indices(geometry, start_str, end_str):
         }
     }
     except Exception as e:
-        print(end_date)
         print("Error : ", e)
         return None
 
@@ -343,13 +343,13 @@ def prediction():
         coordinates = data.get("coordinates")
         if not coordinates:
             return jsonify({'error': 'Missing polygon coordinates'}), 400
-        start_date = data.get("start_date")
-        if not start_date:
-            return jsonify({'error': 'Missing start_date'}), 400
-        end_date = data.get("end_date")
-        if not end_date:
-            end_date = start_date
-        indices = extract_bands_indices(coordinates, start_date, end_date)
+        # start_date = data.get("start_date")
+        # if not start_date:
+        #     return jsonify({'error': 'Missing start_date'}), 400
+        # end_date = data.get("end_date")
+        # if not end_date:
+        #     end_date = start_date
+        indices = extract_bands_indices(coordinates) #, start_date, end_date
         area_values = indices['area_values']
         features = pd.DataFrame([{
         'B2 (496.6nm/492.1nm)': area_values.get('B2', 0),

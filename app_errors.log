@@ -1,0 +1,5 @@
+2025-05-06 14:55:30,398 - ERROR - Error occurred in /prediction: time data '2011-07' does not match format '%Y-%m-%d'
+2025-05-06 14:55:30,399 - INFO - 127.0.0.1 - - [06/May/2025 14:55:30] "[35m[1mPOST /prediction HTTP/1.1[0m" 500 -
+2025-05-06 14:56:00,432 - ERROR - Error occurred in /prediction: 400 Bad Request: Failed to decode JSON object: Expecting ',' delimiter: line 16 column 1 (char 688)
+2025-05-06 14:56:00,432 - INFO - 127.0.0.1 - - [06/May/2025 14:56:00] "[35m[1mPOST /prediction HTTP/1.1[0m" 500 -
+2025-05-06 14:56:20,104 - INFO - 127.0.0.1 - - [06/May/2025 14:56:20] "POST /prediction HTTP/1.1" 200 -
